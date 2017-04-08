@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+
+import collections
+import datetime
+import multiprocessing
+import os
+import queue
+import signal
+import socket
+import sys
+import time
+import uuid
+
+import gi
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, Gdk, GObject
+
+POLL_INTERVAL = 100 # milliseconds
+
+class Connection():
+    def __init__(self, path):
+        self.path = path
+
+    def open(self):
+        try:
+            d = os.path.dirname(self.path)
+            if not os.path.exists(d):
+                os.makedirs(d)
+        except OSError:
+            print('Could not create directory "%s" for the socket' % d)
+            return False
+
+        try:
+            os.mkfifo(self.path)
+        except OSError as e:
+            if e.errno == 98:
+                print('Socket at "%s" already exists' % self.path)
+            else:
+                print('Could not open socket at "%s"' % self.path)
+            return False
+
+        return True
+
+    def close(self):
+        try:
+            os.remove(self.path)
+        except OSError:
+            return False
+
+        return True
+
+    def read(self):
+        with open(self.path, 'r') as f:
+            return f.read()
+
+    def write(self, data):
+        if data is None:
+            data = ''
+
+        with open(self.path, 'w') as f:
+            f.write(data)
+
+class ClipboardEntries(collections.OrderedDict):
+
+    def __init__(self, max=None):
+        self.max = max
+
+    def count(self):
+        return len(self.keys())
+
+    def add(self, content):
+        if self.max is not None and len(self) > self.max:
+            while len(self) > self.max:
+                self.popitem(last=False)
+        key = uuid.uuid4()
+        timestamp = datetime.datetime.now().isoformat(' ')
+        self[key] = { 'key': key, 'content': content, 'timestamp': timestamp }
+        return key
+
+    def first(self):
+        try:
+            return first(iter(self.values()))
+        except IndexError:
+            return None
+
+    def last(self):
+        try:
+            v = next(reversed(self.values()))
+            return v
+        except StopIteration:
+            return None
+
+class Window(Gtk.Window):
+
+    def __init__(
+            self,
+            entries=ClipboardEntries(),
+            commands=multiprocessing.Queue,
+            replies=multiprocessing.Queue,
+            reply_is_necessary=False):
+
+        try:
+            Gtk.Window.__init__(self, title='clipboard-manager')
+            self.set_wmclass('clipboard-manager', 'clipboard-manager')
+            self.connect('delete-event', Gtk.main_quit)
+
+            self.entries = entries
+            self.commands = commands
+            self.replies = replies
+            self.clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+
+            GObject.timeout_add(POLL_INTERVAL, self._clipboard_timer)
+        except KeyboardInterrupt:
+            Gtk.main_quit()
+
+    def _clipboard_timer(self):
+        # multiprocess.Queue.empty() - not always accurate, but good enough
+        while not self.commands.empty():
+            data = None
+            try:
+                data = self.commands.get()
+            except queue.Empty:
+                pass
+
+            if data[0] == 'set':
+                if (len(self.entries) == 0 or
+                        data[1] != self.entries.last()['content']):
+                    self.entries.add(data[1])
+                    self.clipboard.set_text(data[1], -1)
+                    self.clipboard.store()
+                    self.replies.put('set')
+                else:
+                    self.replies.put('not set')
+            elif data[0] == 'get':
+                self.replies.put(self.entries.get(data[1], ''))
+            elif data[0] == 'current':
+                content = self.clipboard.wait_for_text()
+                self.replies.put(content)
+            elif data[0] == 'summaries':
+                summaries = '\n'.join([
+                    '%s %s %s' % (
+                        k, v['timestamp'], v['content'][:50],
+                    ) for k, v in reversed(self.entries.items())
+                ])
+                self.replies.put(summaries)
+
+        content = self.clipboard.wait_for_text()
+        if content:
+            if (len(self.entries) == 0 or
+                    content != self.entries.last()['content']):
+                self.entries.add(content)
+        else:
+            entry = self.entries.last()
+            if entry:
+                content = self.entries.last()['content']
+                if content:
+                    self.clipboard.set_text(content, -1)
+
+        return True
+
+def worker(socket_path, entries, commands, replies, reply_is_necessary):
+    connection = Connection(socket_path)
+    connection_status = connection.open()
+    if connection_status == False:
+        return
+
+    while True:
+        if reply_is_necessary and replies.empty():
+            time.sleep(.100)
+            continue
+        reply_is_necessary = False
+
+        # multiprocess.Queue.empty() - not always accurate, but good enough
+        while not replies.empty():
+            reply = None
+            try:
+                reply = replies.get()
+            except queue.Empty:
+                continue
+
+            output = ''
+            if type(reply) is str:
+                output = reply
+            elif type(reply) is dict:
+                output = '%s %s %s' % (
+                    reply['key'], reply['timestamp'], reply['content'],
+                )
+            connection.write(output)
+
+        msg = connection.read().rstrip()
+        if msg.startswith('set '):
+            reply_is_necessary = True
+            commands.put(('set', msg[4:],))
+        elif msg == 'current':
+            reply_is_necessary = True
+            commands.put(('current', None,))
+        elif msg.startswith('get '):
+            reply_is_necessary = True
+            commands.put(('get', msg[4:40],))
+        elif msg == 'summaries':
+            reply_is_necessary = True
+            commands.put(('summaries', None,))
+        else:
+            connection.write('? - unknown command')
+
+        continue
+
+    connection.close()
+
+if __name__ == '__main__':
+    xdg_cache_dir = os.environ.get('XDG_CACHE_HOME', '~/.cache')
+    socket_path = os.path.join(xdg_cache_dir, 'clipboard-manager', 'clipboard-manager.sock')
+
+    def signal_handler(signum, frame):
+        try:
+            os.remove(socket_path)
+        except OSError:
+            pass
+        sys.exit(0)
+
+    entries = ClipboardEntries()
+    commands = multiprocessing.Queue()
+    replies = multiprocessing.Queue()
+    reply_is_necessary = False
+    Window(entries=entries,
+           commands=commands,
+           replies=replies,
+           reply_is_necessary=reply_is_necessary)
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    try:
+        args = (socket_path, entries, commands, replies, reply_is_necessary,)
+        p = multiprocessing.Process(target=worker, args=args)
+        p.daemon = True
+        p.start()
+
+        Gtk.main()
+    except KeyboardInterrupt:
+        p.terminate()
+
+    try:
+        os.remove(socket_path)
+    except OSError:
+        pass

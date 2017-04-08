@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+IFS=$'\n\t'
+
+command="$1"
+
+dmenu=dmenu
+
+cache_dir=${XDG_CACHE_HOME:-~/.cache}/clipboard-manager
+socket=$cache_dir/clipboard-manager.sock
+
+if [ -z "$command" ] ; then
+  exit 1
+elif [ ! -p "$socket" ] ; then
+  if [ "$command" == "menu" ] ; then
+    "$dmenu"
+  fi
+  exit 1
+fi
+
+if ! pgrep clipboard-manager ; then
+  exit 1
+fi
+
+if [ "$command" == "menu" ] ; then
+  echo "summaries" > "$socket"
+  items=$(cat "$socket" | cut -d' ' -f 4-)
+
+  selection=$(echo "$items" | "$dmenu")
+
+  echo "set $selection" > "$socket"
+  cat "$socket" &>/dev/null
+elif [ "$command" == "get" ] ; then
+  if [ -z "$2" ] ; then
+    exit 1
+  fi
+
+  echo "set $2" > "$socket"
+  lines=$(cat "$socket")
+elif [ "$command" == "input" ] ; then
+  input=$(cat)
+  echo "set $input" > "$socket"
+  cat "$socket" &>/dev/null
+elif [ "$command" == "output" ] ; then
+  echo "current" > "$socket"
+  cat "$socket"
+else
+  exit 1
+fi
